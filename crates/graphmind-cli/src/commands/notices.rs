@@ -127,29 +127,53 @@ fn now_secs() -> u64 {
 
 /// Auto-reinstall hooks/skills/CLAUDE.md in background when binary version is newer than installed setup.
 /// Runs at most once per day (stamp file). Triggered by brew upgrade or any binary replacement.
+///
+/// `setup` runs as a detached, silent child process: a thread would die with the command that
+/// started it (usually a few milliseconds later), and its output must not reach that command's
+/// stdout (hooks capture it). The stamp is written before spawning, so the many commands hooks
+/// run concurrently start one setup, not one each.
 pub fn auto_setup_if_outdated() {
     let config = graphmind_config::load_config();
-    let local = config.setup_version;
-    let expected = graphmind_config::SETUP_VERSION;
-    if local >= expected {
+    if config.setup_version >= graphmind_config::SETUP_VERSION {
         return;
     }
 
+    // "<unix ts> <setup version>": throttles retries of this version's setup only. A stamp
+    // left by an older version (plain timestamp) must not delay the new one by a day.
     const ONE_DAY: u64 = 86_400;
+    let expected = graphmind_config::SETUP_VERSION;
     let stamp = graphmind_config::paths::graphmind_dir().join("auto-setup.stamp");
     let now = now_secs();
     if let Ok(raw) = fs::read_to_string(&stamp) {
-        if let Ok(ts) = raw.trim().parse::<u64>() {
-            if now.saturating_sub(ts) < ONE_DAY {
+        let mut parts = raw.split_whitespace();
+        let ts = parts.next().and_then(|t| t.parse::<u64>().ok());
+        let version = parts.next().and_then(|v| v.parse::<u32>().ok());
+        if let (Some(ts), Some(version)) = (ts, version) {
+            if version == expected && now.saturating_sub(ts) < ONE_DAY {
                 return;
             }
         }
     }
+    if fs::write(&stamp, format!("{now} {expected}")).is_err() {
+        return;
+    }
 
-    std::thread::spawn(move || {
-        super::setup::setup();
-        let _ = fs::write(&stamp, now.to_string());
-    });
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("setup")
+        .env("GRAPHMIND_SKIP_NOTICES", "1")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd.spawn();
 }
 
 pub fn check_setup_version() {
