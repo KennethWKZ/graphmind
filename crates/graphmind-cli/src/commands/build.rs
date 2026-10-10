@@ -71,6 +71,85 @@ pub fn build(slug: Option<&str>, all: bool, full: bool, reset: bool, watch: bool
     build_single(&slug, full, reset, false);
 }
 
+/// `graphmind build --changed <old-head> <new-head>` — invoked by the
+/// post-checkout hook after a branch switch. Rebuilds only the files that
+/// differ between the two refs, reusing the same incremental machinery the
+/// file-watcher uses (`build_changed_files`).
+pub fn build_changed_between(slug: Option<&str>, old_head: &str, new_head: &str) {
+    let slug = match resolve_project_slug(&[slug]) {
+        Some(s) => s,
+        None => {
+            eprintln!("{} No project specified and none could be resolved", "Error:".red().bold());
+            std::process::exit(1);
+        }
+    };
+
+    let project = match Registry::get(&slug) {
+        Some(p) => p,
+        None => {
+            eprintln!("{} Project \"{}\" not found", "Error:".red().bold(), slug);
+            std::process::exit(1);
+        }
+    };
+
+    let output = graphmind_config::git_identity::git_command(Path::new(&project.path))
+        .args(["diff", "--name-only", old_head, new_head])
+        .output();
+
+    let rel_paths: Vec<String> = match output {
+        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+        _ => {
+            eprintln!("{} git diff failed between {} and {}", "Error:".red().bold(), old_head, new_head);
+            std::process::exit(1);
+        }
+    };
+
+    if rel_paths.is_empty() {
+        return;
+    }
+
+    let project_path = PathBuf::from(&project.path);
+    let changed_paths: Vec<PathBuf> = rel_paths.iter().map(|p| project_path.join(p)).collect();
+
+    let result = build_changed_files(&slug, &changed_paths);
+    println!(
+        "{} {} file{} | {} symbols | {} edges | {}ms",
+        "OK".green().bold(),
+        result.files_processed,
+        if result.files_processed == 1 { "" } else { "s" },
+        result.symbols_found.to_string().green(),
+        result.edges_created.to_string().green(),
+        result.duration_ms
+    );
+
+    let global_config = load_config();
+    if global_config.embedding.mode != EmbeddingMode::Disabled {
+        run_embedding_for_files(&slug, &rel_paths, &global_config.embedding);
+    }
+}
+
+/// Stamps a finished build on the project, with the branch it was built from
+/// (worktree metadata shown by `list`) and its repo identity if it predates it.
+fn record_build(slug: &str, project_path: &str, lang_names: &[String]) {
+    let path = Path::new(project_path);
+    let branch = graphmind_config::git_identity::current_branch(path);
+    let repo_id = Registry::get(slug)
+        .filter(|p| p.repo_id.is_none())
+        .and_then(|_| graphmind_config::git_identity::repo_id(path));
+    Registry::update_project(slug, |p| {
+        p.last_build = Some(chrono::Utc::now().to_rfc3339());
+        p.languages = lang_names.to_vec();
+        p.branch = branch;
+        if repo_id.is_some() {
+            p.repo_id = repo_id;
+        }
+    });
+}
+
 fn build_single(slug: &str, full: bool, reset: bool, is_all: bool) {
     let project = match Registry::get(slug) {
         Some(p) => p,
@@ -79,6 +158,8 @@ fn build_single(slug: &str, full: bool, reset: bool, is_all: bool) {
             return;
         }
     };
+
+    let _build_lock = graphmind_config::lock_build(slug);
 
     println!(
         "{} Building {} at {}",
@@ -104,6 +185,16 @@ fn build_single(slug: &str, full: bool, reset: bool, is_all: bool) {
         std::fs::remove_file(&db_path).ok();
         std::fs::remove_dir_all(&cache_dir).ok();
         println!("{} DB and cache cleared", ">>".cyan().bold());
+    }
+
+    // A worktree's first build starts from its primary's graph: only the files that
+    // differ between the two checkouts get parsed.
+    if !reset && !db_path.exists() {
+        if let Some(primary) = &project.primary {
+            if graphmind_config::seed_graph(slug, primary) {
+                println!("{} Seeded from {}'s graph", ">>".cyan().bold(), primary.cyan());
+            }
+        }
     }
 
     let mut builder = GraphBuilder::new(&db_path_str, &cache_dir_str);
@@ -136,10 +227,7 @@ fn build_single(slug: &str, full: bool, reset: bool, is_all: bool) {
     let lang_names: Vec<String> = langs.iter().map(|l| l.language.clone()).collect();
 
     // Update project config with build info
-    Registry::update_project(slug, |p| {
-        p.last_build = Some(chrono::Utc::now().to_rfc3339());
-        p.languages.clone_from(&lang_names);
-    });
+    record_build(slug, &project.path, &lang_names);
 
     // Write meta.json
     let meta = json!({
@@ -402,6 +490,8 @@ fn build_changed_files(slug: &str, changed_paths: &[PathBuf]) -> BuildResult {
         None => return BuildResult::default(),
     };
 
+    let _build_lock = graphmind_config::lock_build(slug);
+
     let project_path = PathBuf::from(&project.path);
     let rel_paths: Vec<String> = changed_paths
         .iter()
@@ -443,10 +533,7 @@ fn build_changed_files(slug: &str, changed_paths: &[PathBuf]) -> BuildResult {
     let langs = queries.language_breakdown();
     let lang_names: Vec<String> = langs.iter().map(|l| l.language.clone()).collect();
 
-    Registry::update_project(slug, |p| {
-        p.last_build = Some(chrono::Utc::now().to_rfc3339());
-        p.languages.clone_from(&lang_names);
-    });
+    record_build(slug, &project.path, &lang_names);
 
     let meta = json!({
         "slug": slug,

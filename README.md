@@ -257,6 +257,51 @@ graphmind install hook-git
 
 </details>
 
+## Git Worktrees & Branches
+
+graphmind is worktree-aware. Each checkout of a repo gets its own code graph,
+so answers always describe the branch you are on, while memory (decisions,
+conventions, bugs) is shared by all of them: it is repo-wide knowledge.
+
+- **Zero setup for new worktrees**: `git worktree add` (or `claude --worktree`,
+  or any graphmind command / MCP call made from a new checkout) registers the
+  worktree on the spot. Identity is proven by git (`--git-common-dir`), never
+  guessed from names.
+- **Nested worktrees**: checkouts inside the main one — Claude Code's
+  `.claude/worktrees/<name>` — resolve to themselves, never to the main
+  checkout's graph.
+- **Fast first build**: a new worktree's graph is copied from the main
+  checkout's, then updated incrementally in the background. Only the files
+  that differ between the two checkouts get parsed.
+- **Shared memory**: a worktree uses its main project's memory file
+  (`graphmind list` shows `worktree of <slug>`).
+- **Reindex on git activity**: the git hooks (`graphmind install hook-git`,
+  run by `graphmind init`) rebuild after commit, merge, rebase and branch
+  switch. Hooks live in the repo's git dir, so every worktree gets them.
+  Repos using husky or a shared `core.hooksPath` are not modified; graphmind
+  prints the lines to add.
+- **No silent wrong answers**: from a git repo that is neither registered nor
+  a worktree of a registered repo, commands fail with an explicit error
+  instead of answering from another project. Outside any git repo, a single
+  registered project is still used as before.
+- **Cleanup**: worktrees that were registered automatically are forgotten
+  once their directory is gone. `graphmind clean --stale` prunes the rest.
+
+### Agents switching worktrees mid-session
+
+An MCP server answers for the checkout it was started in. When an agent moves
+into another worktree during a session, it should pass
+`project=<absolute path of that worktree>` (or its slug) to graphmind tools;
+the server instructions tell agents to do so.
+
+### Upgrading
+
+Nothing to migrate. Existing projects, graphs and memory files are used as
+they are; projects registered before worktree support are recognized on
+first use. After the upgrade, `graphmind setup` (re-run automatically when
+the binary is updated) adds the new git hooks to repos that already have
+graphmind's hooks.
+
 ## Architecture
 
 ```
@@ -406,6 +451,7 @@ graphmind build --full        # force full rebuild
 graphmind build --watch       # watch mode (debounced 2s)
 graphmind clean [slug]        # remove graph cache (forces full rebuild)
 graphmind clean --all         # clean all projects
+graphmind clean --stale       # unregister projects whose worktree was removed
 ```
 
 ### Query

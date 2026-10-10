@@ -1,8 +1,9 @@
-use crate::paths;
+use crate::{git_identity, paths};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(rename_all = "snake_case")]
@@ -46,7 +47,10 @@ pub struct LicenseConfig {
 /// v3 — issue #105: MCP entries no longer carry an `env.PATH` block, and the
 /// global `env.PATH` in ~/.claude/settings.json is removed. Bumping this makes
 /// `auto_setup_if_outdated()` run the repair for already-installed users.
-pub const SETUP_VERSION: u32 = 3;
+///
+/// v4 — git worktree support: setup adds the post-checkout / post-merge /
+/// post-rewrite git hooks to repos that already have graphmind's hooks.
+pub const SETUP_VERSION: u32 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct McpConfig {
@@ -93,6 +97,19 @@ pub struct ProjectConfig {
     pub auto_watch: bool,
     pub languages: Vec<String>,
     pub exclude: Vec<String>,
+    /// Identity shared by every worktree of the same logical git repo.
+    /// `None` for projects not inside a git repo (or registered before
+    /// this field existed) — such projects keep pure path-based behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo_id: Option<String>,
+    /// Metadata only, refreshed on build — never a storage key.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
+    /// For a worktree of an already-registered repo: the slug of the project
+    /// whose memory it shares. `None` for every project registered before
+    /// worktree support, which keeps its own memory exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub primary: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
@@ -196,11 +213,54 @@ pub fn load_config() -> GlobalConfig {
     }
 }
 
+/// Writes `config` atomically (temp file + rename on the same filesystem),
+/// so a concurrent reader always sees either the old or the new complete
+/// file, never a truncated/corrupt one.
 pub fn save_config(config: &GlobalConfig) {
     ensure_dirs();
     let json = serde_json::to_string_pretty(config).unwrap_or_default();
-    if let Err(e) = fs::write(paths::config_path(), json) {
+    let path = paths::config_path();
+    let tmp_path = path.with_extension(format!(
+        "tmp.{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    if let Err(e) = fs::write(&tmp_path, json) {
         eprintln!("Warning: Failed to write config: {e}");
+        return;
+    }
+    if let Err(e) = fs::rename(&tmp_path, &path) {
+        eprintln!("Warning: Failed to write config: {e}");
+    }
+}
+
+/// Runs `f` while holding an exclusive lock on `~/.graphmind/config.lock`,
+/// serializing read-modify-write sequences against `config.json` across
+/// processes (e.g. several `graphmind`/`graphmind mcp` processes each
+/// registering their own worktree at the same time). Without this, two
+/// concurrent writers can each read the same config, apply their own
+/// change, and the second `save_config` silently clobbers the first's.
+///
+/// Best-effort: if the lock file can't be opened, `f` still runs
+/// unlocked rather than failing the whole operation.
+fn with_config_lock<R>(f: impl FnOnce() -> R) -> R {
+    use fs4::FileExt;
+    ensure_dirs();
+    match fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(paths::config_lock_path())
+    {
+        Ok(lock_file) => {
+            let _ = FileExt::lock(&lock_file);
+            let result = f();
+            let _ = lock_file.unlock();
+            result
+        }
+        Err(_) => f(),
     }
 }
 
@@ -216,44 +276,254 @@ pub fn slugify(input: &str) -> String {
         .collect()
 }
 
+fn canonical(path: &str) -> String {
+    fs::canonicalize(path)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Like [`load_config`], but `None` when config.json exists and can't be read or
+/// parsed. Anything that writes the config back must use this: saving the defaults
+/// `load_config` falls back to would unregister every project.
+fn try_load_config() -> Option<GlobalConfig> {
+    let path = paths::config_path();
+    if !path.exists() {
+        return Some(GlobalConfig::default());
+    }
+    let raw = fs::read_to_string(&path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// Read-modify-write of config.json under the cross-process lock. `f` returns its
+/// result and whether the config changed (only then is it written). `None` when
+/// the config on disk is unreadable: it is left as is.
+fn mutate_config<R>(f: impl FnOnce(&mut GlobalConfig) -> (R, bool)) -> Option<R> {
+    with_config_lock(|| {
+        let Some(mut config) = try_load_config() else {
+            eprintln!(
+                "Warning: {} could not be read — not modifying it",
+                paths::config_path().display()
+            );
+            return None;
+        };
+        let (result, changed) = f(&mut config);
+        if changed {
+            save_config(&config);
+        }
+        Some(result)
+    })
+}
+
+/// `base`, unless a project at another path already uses it: then `base-<hash of
+/// the path>`. Worktrees are often named alike (`~/a/app`, `~/b/app`), and reusing
+/// the slug would silently re-point the existing project at the new path.
+fn unique_slug(config: &GlobalConfig, base: &str, abs_path: &str) -> String {
+    let free = |s: &str| config.projects.get(s).is_none_or(|p| p.path == abs_path);
+    if free(base) {
+        return base.to_string();
+    }
+    let hash = format!("{:x}", Sha256::digest(abs_path.as_bytes()));
+    let short = format!("{base}-{}", &hash[..6]);
+    if free(&short) {
+        short
+    } else {
+        format!("{base}-{}", &hash[..12])
+    }
+}
+
+/// Fills `repo_id` for projects registered before it existed. Returns whether any
+/// project changed. One git call per such project, once: the result is saved.
+fn backfill_repo_ids(config: &mut GlobalConfig) -> bool {
+    let mut changed = false;
+    for p in config.projects.values_mut() {
+        if p.repo_id.is_none() && Path::new(&p.path).is_dir() {
+            if let Some(id) = git_identity::repo_id(Path::new(&p.path)) {
+                p.repo_id = Some(id);
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+/// The registered project of `repo_id` that `dir` corresponds to in the checkout
+/// rooted at `root`: the one whose position inside its own checkout contains `dir`
+/// (deepest wins, so a monorepo's `packages/api` beats the repo root). Returns
+/// that project and where it sits in `root`.
+fn family_match(
+    config: &GlobalConfig,
+    repo_id: &str,
+    root: &Path,
+    dir: &Path,
+) -> Option<(PathBuf, ProjectConfig)> {
+    config
+        .projects
+        .values()
+        .filter(|p| p.repo_id.as_deref() == Some(repo_id) && Path::new(&p.path) != dir)
+        .filter_map(|p| {
+            let p_root = git_identity::work_tree(Path::new(&p.path))?.root;
+            let rel = Path::new(&p.path).strip_prefix(&p_root).ok()?.to_path_buf();
+            // `join("")` would append a trailing separator, and registered paths
+            // are compared as strings.
+            let here = if rel.as_os_str().is_empty() { root.to_path_buf() } else { root.join(&rel) };
+            dir.starts_with(&here).then(|| (rel.components().count(), here, p.clone()))
+        })
+        .max_by_key(|(depth, _, _)| *depth)
+        .map(|(_, here, p)| (here, p))
+}
+
 pub struct Registry;
 
 impl Registry {
     pub fn register(path: &str, slug: Option<&str>, exclude: &[String]) -> ProjectConfig {
-        let mut config = load_config();
-        let abs_path = fs::canonicalize(path)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| path.to_string());
-        let slug = slug
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| slugify(&abs_path));
-
+        let abs_path = canonical(path);
+        let repo_id = git_identity::repo_id(Path::new(&abs_path));
+        let root = git_identity::work_tree(Path::new(&abs_path)).map(|w| w.root);
+        let branch = git_identity::current_branch(Path::new(&abs_path));
         let now = chrono::Utc::now().to_rfc3339();
-        let project = ProjectConfig {
-            path: abs_path,
-            slug: slug.clone(),
-            registered: now,
+
+        let build = |slug: String, primary: Option<String>| ProjectConfig {
+            path: abs_path.clone(),
+            slug,
+            registered: now.clone(),
             last_build: None,
             auto_watch: false,
             languages: Vec::new(),
             exclude: exclude.to_vec(),
+            repo_id: repo_id.clone(),
+            branch: branch.clone(),
+            primary,
         };
 
-        config.projects.insert(slug.clone(), project.clone());
-        save_config(&config);
+        let project = mutate_config(|config| {
+            backfill_repo_ids(config);
+            let existing = config.projects.values().find(|p| p.path == abs_path).cloned();
+            let slug = match (slug, &existing) {
+                (Some(s), _) => s.to_string(),
+                // Re-running `init` keeps the project's name, auto-linked worktrees included.
+                (None, Some(e)) => e.slug.clone(),
+                (None, None) => unique_slug(config, &slugify(&abs_path), &abs_path),
+            };
+            // Another worktree of a registered repo shares that project's memory.
+            let primary = match &existing {
+                Some(e) => e.primary.clone(),
+                None => match (&repo_id, &root) {
+                    (Some(id), Some(root)) => family_match(config, id, root, Path::new(&abs_path))
+                        .filter(|(here, _)| here == Path::new(&abs_path))
+                        .map(|(_, p)| p.primary.unwrap_or(p.slug)),
+                    _ => None,
+                },
+            };
+            let project = build(slug.clone(), primary);
+            config.projects.insert(slug, project.clone());
+            (project, true)
+        })
+        .unwrap_or_else(|| build(slug.map(String::from).unwrap_or_else(|| slugify(&abs_path)), None));
 
-        fs::create_dir_all(paths::graph_dir(&slug)).ok();
+        fs::create_dir_all(paths::graph_dir(&project.slug)).ok();
 
         project
     }
 
-    pub fn unregister(slug: &str) -> bool {
-        let mut config = load_config();
-        let removed = config.projects.remove(slug).is_some();
-        if removed {
-            save_config(&config);
+    /// Registers the checkout containing `dir` when it is another worktree of a
+    /// registered repo, at the same place in the checkout as the registered
+    /// project (`git worktree add`, Claude Code's `.claude/worktrees/<name>`, …).
+    /// The new project shares that project's memory (`primary`) and excludes, and
+    /// gets its own graph, seeded from that project's (see [`crate::seed`]). Also forgets auto-linked worktrees whose directory is
+    /// gone: their memory lives with the primary, so nothing is lost.
+    ///
+    /// `None` when `dir` isn't in a git repo or no registered project matches.
+    pub fn link_worktree(dir: &Path) -> Option<ProjectConfig> {
+        let repo_id = git_identity::repo_id(dir)?;
+        // Lock-free early exit for the common case — a repo graphmind doesn't know —
+        // since hooks run this on every tool call there.
+        let known = load_config().projects.values().any(|p| {
+            p.repo_id.as_deref() == Some(repo_id.as_str())
+                || (p.repo_id.is_none() && Path::new(&p.path).is_dir())
+        });
+        if !known {
+            return None;
         }
-        removed
+        let root = git_identity::work_tree(dir)?.root;
+        let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf());
+
+        let (linked, pruned) = mutate_config(|config| {
+            let backfilled = backfill_repo_ids(config);
+            let Some((here, sibling)) = family_match(config, &repo_id, &root, &dir) else {
+                return ((None, Vec::new()), backfilled);
+            };
+            let path = here.to_string_lossy().to_string();
+            let slug = unique_slug(config, &slugify(&path), &path);
+            let project = ProjectConfig {
+                path,
+                slug: slug.clone(),
+                registered: chrono::Utc::now().to_rfc3339(),
+                last_build: None,
+                auto_watch: false,
+                languages: Vec::new(),
+                exclude: sibling.exclude.clone(),
+                repo_id: Some(repo_id.clone()),
+                branch: git_identity::current_branch(&here),
+                primary: Some(sibling.primary.clone().unwrap_or(sibling.slug.clone())),
+            };
+            config.projects.insert(slug.clone(), project.clone());
+            // Locked before the registration is visible to other processes, so a
+            // build they start waits for the seed below instead of racing it. Never
+            // waited for while holding the config lock (a build takes them in the
+            // other order): if it is taken, there is no seed, just a full build.
+            let lock = crate::seed::try_lock_build(&slug);
+
+            let gone: Vec<String> = config
+                .projects
+                .values()
+                .filter(|p| p.primary.is_some() && !Path::new(&p.path).exists())
+                .map(|p| p.slug.clone())
+                .collect();
+            for slug in &gone {
+                config.projects.remove(slug);
+            }
+            ((Some((project, sibling.slug, lock)), gone), true)
+        })?;
+
+        for slug in pruned {
+            fs::remove_dir_all(paths::graph_dir(&slug)).ok();
+        }
+        let (project, sibling, lock) = linked?;
+        if lock.is_some() {
+            crate::seed::seed_graph(&project.slug, &sibling);
+        }
+        drop(lock);
+        crate::seed::worktree_linked(&project);
+        Some(project)
+    }
+
+    /// Fills in `repo_id` for every project registered before it existed, so their
+    /// worktrees can be recognized. Cheap after the first run.
+    pub fn backfill_repo_ids() {
+        let needed = load_config()
+            .projects
+            .values()
+            .any(|p| p.repo_id.is_none() && Path::new(&p.path).is_dir());
+        if needed {
+            mutate_config(|config| ((), backfill_repo_ids(config)));
+        }
+    }
+
+    /// The key `slug`'s memory is stored under: its primary project's for a
+    /// worktree linked to one (decisions and conventions are repo-wide), else
+    /// `slug` itself — exactly what every project used before worktree support.
+    pub fn memory_key(slug: &str) -> String {
+        Self::get(slug)
+            .and_then(|p| p.primary)
+            .unwrap_or_else(|| slug.to_string())
+    }
+
+    pub fn unregister(slug: &str) -> bool {
+        mutate_config(|config| {
+            let removed = config.projects.remove(slug).is_some();
+            (removed, removed)
+        })
+        .unwrap_or(false)
     }
 
     pub fn get(slug: &str) -> Option<ProjectConfig> {
@@ -266,25 +536,36 @@ impl Registry {
         config.projects.values().cloned().collect()
     }
 
+    /// The registered project containing `path` (deepest root wins). Not when a
+    /// linked worktree starts between the project's root and `path`: Claude Code
+    /// puts worktrees in `<repo>/.claude/worktrees/<name>`, and answering from the
+    /// main checkout's graph there would silently describe another branch.
     pub fn find_by_path(path: &str) -> Option<ProjectConfig> {
         let config = load_config();
-        let abs_path = fs::canonicalize(path)
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|_| path.to_string());
-        config
+        let abs_path = canonical(path);
+        let best = config
             .projects
             .values()
             .filter(|p| abs_path == p.path || abs_path.starts_with(&format!("{}/", p.path)))
-            .max_by_key(|p| p.path.len())
-            .cloned()
+            .max_by_key(|p| p.path.len())?;
+        if best.path != abs_path {
+            if let Some(wt) = git_identity::work_tree(Path::new(&abs_path)) {
+                if wt.linked && wt.root != Path::new(&best.path) && wt.root.starts_with(&best.path) {
+                    return None;
+                }
+            }
+        }
+        Some(best.clone())
     }
 
     pub fn update_project(slug: &str, f: impl FnOnce(&mut ProjectConfig)) {
-        let mut config = load_config();
-        if let Some(project) = config.projects.get_mut(slug) {
-            f(project);
-            save_config(&config);
-        }
+        mutate_config(|config| match config.projects.get_mut(slug) {
+            Some(project) => {
+                f(project);
+                ((), true)
+            }
+            None => ((), false),
+        });
     }
 
     pub fn get_config() -> GlobalConfig {
@@ -322,5 +603,58 @@ mod startup_config_tests {
         let cfg: GlobalConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.launch_at_login);
         assert!(!cfg.build_all_on_startup);
+    }
+}
+
+#[cfg(test)]
+mod concurrent_registration_tests {
+    use super::*;
+
+    /// Simulates several processes each registering their own worktree at
+    /// roughly the same time (e.g. multiple Claude Code agents, each
+    /// running `graphmind init` in a different git worktree of the same
+    /// repo). Without with_config_lock serializing the read-modify-write
+    /// in Registry::register, a losing thread's save_config would clobber
+    /// a winning thread's — this asserts none are lost.
+    #[test]
+    fn concurrent_register_calls_lose_no_project() {
+        let dir = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("HOME", dir.path()) };
+
+        const N: usize = 12;
+        let mut project_dirs = Vec::new();
+        for i in 0..N {
+            let p = dir.path().join(format!("project-{i}"));
+            fs::create_dir_all(&p).unwrap();
+            project_dirs.push(p);
+        }
+
+        let handles: Vec<_> = project_dirs
+            .into_iter()
+            .enumerate()
+            .map(|(i, path)| {
+                std::thread::spawn(move || {
+                    Registry::register(path.to_str().unwrap(), Some(&format!("proj-{i}")), &[]);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let registered = Registry::list();
+        assert_eq!(
+            registered.len(),
+            N,
+            "expected all {N} concurrent registrations to survive, found {}: {:?}",
+            registered.len(),
+            registered.iter().map(|p| &p.slug).collect::<Vec<_>>()
+        );
+        for i in 0..N {
+            assert!(
+                Registry::get(&format!("proj-{i}")).is_some(),
+                "proj-{i} should be registered"
+            );
+        }
     }
 }

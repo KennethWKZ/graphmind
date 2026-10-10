@@ -1521,6 +1521,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "fs4"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7e72ed92b67c146290f88e9c89d60ca163ea417a446f61ffd7b72df3e7f1dfd5"
+dependencies = [
+ "rustix 1.1.4",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "fsevent-sys"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1872,12 +1882,13 @@ dependencies = [
 
 [[package]]
 name = "graphmind-cli"
-version = "0.2.215"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "clap",
  "colored",
  "dirs 5.0.1",
+ "fs4",
  "graphmind-config",
  "graphmind-core",
  "graphmind-db",
@@ -1898,17 +1909,21 @@ dependencies = [
 
 [[package]]
 name = "graphmind-config"
-version = "0.2.215"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
+ "fs4",
+ "rusqlite",
  "serde",
  "serde_json",
+ "sha2",
+ "tempfile",
 ]
 
 [[package]]
 name = "graphmind-core"
-version = "0.2.215"
+version = "0.3.0"
 dependencies = [
  "napi",
  "napi-build",
@@ -1950,7 +1965,7 @@ dependencies = [
 
 [[package]]
 name = "graphmind-db"
-version = "0.2.215"
+version = "0.3.0"
 dependencies = [
  "criterion",
  "graphmind-core",
@@ -1966,7 +1981,7 @@ dependencies = [
 
 [[package]]
 name = "graphmind-desktop"
-version = "0.2.215"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "dirs 5.0.1",
@@ -1993,7 +2008,7 @@ dependencies = [
 
 [[package]]
 name = "graphmind-embeddings"
-version = "0.2.215"
+version = "0.3.0"
 dependencies = [
  "dirs 5.0.1",
  "fastembed",
@@ -2008,7 +2023,7 @@ dependencies = [
 
 [[package]]
 name = "graphmind-license"
-version = "0.2.215"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "graphmind-config",
@@ -2021,7 +2036,7 @@ dependencies = [
 
 [[package]]
 name = "graphmind-mcp"
-version = "0.2.215"
+version = "0.3.0"
 dependencies = [
  "chrono",
  "graphmind-config",
@@ -2037,9 +2052,10 @@ dependencies = [
 
 [[package]]
 name = "graphmind-memory"
-version = "0.2.215"
+version = "0.3.0"
 dependencies = [
  "chrono",
+ "fs4",
  "graphmind-db",
  "rusqlite",
  "serde",

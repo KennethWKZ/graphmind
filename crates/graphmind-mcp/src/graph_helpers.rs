@@ -12,7 +12,7 @@ where
     let project_slug = args.get("project").and_then(|v| v.as_str());
     let proj = match resolve_project(project_slug) {
         Some(p) => p,
-        None => return err_text("No project found. Register one with `graphmind init`."),
+        None => return err_text(&no_project_message()),
     };
     let db_path = graphmind_config::paths::graph_db_path(&proj.slug);
     if !db_path.exists() {
@@ -30,11 +30,26 @@ where
     f(&gq, &proj)
 }
 
+/// Resolves the project a tool call targets exactly as the CLI does: the
+/// `project` argument (a slug, or a directory path such as the worktree an agent
+/// works in), else the MCP server's working directory. Never "the first
+/// registered project": with one project per worktree that would answer from
+/// whichever one the map happens to list first.
 pub(crate) fn resolve_project(explicit: Option<&str>) -> Option<ProjectConfig> {
-    if let Some(slug) = explicit {
-        return graphmind_config::Registry::get(slug);
+    let slug = graphmind_config::resolve_project_slug(&[explicit])?;
+    graphmind_config::Registry::get(&slug)
+}
+
+pub(crate) fn no_project_message() -> String {
+    let mut slugs = all_project_slugs();
+    if slugs.is_empty() {
+        return "No project found. Register one with `graphmind init`.".to_string();
     }
-    graphmind_config::Registry::list().into_iter().next()
+    slugs.sort();
+    format!(
+        "No project matches this server's working directory. Pass project=<slug> or project=<absolute path of the checkout you are working in>. Registered: {}",
+        slugs.join(", ")
+    )
 }
 
 pub(crate) fn all_project_slugs() -> Vec<String> {

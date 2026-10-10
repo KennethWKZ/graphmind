@@ -1,10 +1,16 @@
-use graphmind_config::{paths, resolve_project_slug};
+use graphmind_config::{paths, resolve_project_slug, Registry};
 use colored::Colorize;
 use graphmind_memory::search::search as memory_search;
 use graphmind_memory::store::{AddOptions, MemorySource, MemoryStore, MemoryType, default_ttl_for_type};
 
 fn get_store() -> MemoryStore {
     MemoryStore::new(&paths::memory_dir())
+}
+
+/// Resolves `slug` to the key the memory store files entries under: the
+/// primary project's for a linked worktree, else the slug. See `Registry::memory_key`.
+fn resolve_memory_project(slug: Option<&str>) -> Option<String> {
+    resolve_project_slug(&[slug]).map(|s| Registry::memory_key(&s))
 }
 
 fn parse_memory_type(s: &str) -> MemoryType {
@@ -26,7 +32,7 @@ pub fn add(content: &str, slug: Option<&str>, global: bool, tags: &[String], ent
     let project = if global {
         None
     } else {
-        match resolve_project_slug(&[slug]) {
+        match resolve_memory_project(slug) {
             Some(s) => Some(s),
             None => {
                 eprintln!(
@@ -64,7 +70,7 @@ pub fn add(content: &str, slug: Option<&str>, global: bool, tags: &[String], ent
 
 pub fn search(query: &str, slug: Option<&str>, limit: usize) {
     let store = get_store();
-    let project = resolve_project_slug(&[slug]);
+    let project = resolve_memory_project(slug);
     let entries = store.list(project.as_deref());
     let results = memory_search(&entries, query, limit);
 
@@ -99,7 +105,7 @@ pub fn search(query: &str, slug: Option<&str>, limit: usize) {
 
 pub fn list(slug: Option<&str>, limit: usize, priority_only: bool, run_clean: bool) {
     let store = get_store();
-    let project = resolve_project_slug(&[slug]);
+    let project = resolve_memory_project(slug);
 
     if run_clean {
         let summary = consolidate_steps_abcd(&store, project.as_deref(), false);
@@ -149,7 +155,7 @@ pub fn list(slug: Option<&str>, limit: usize, priority_only: bool, run_clean: bo
 
 pub fn delete(id: &str, slug: Option<&str>) {
     let store = get_store();
-    let project = resolve_project_slug(&[slug]);
+    let project = resolve_memory_project(slug);
     if store.delete(id, project.as_deref()) {
         println!("{} Memory deleted: {}", "OK".green().bold(), id.dimmed());
     } else {
@@ -161,7 +167,7 @@ pub fn delete(id: &str, slug: Option<&str>) {
 /// `graphmind memory clean` — steps A+B+C+D, no external API.
 pub fn clean(slug: Option<&str>) {
     let store = get_store();
-    let project = resolve_project_slug(&[slug]);
+    let project = resolve_memory_project(slug);
     let summary = consolidate_steps_abcd(&store, project.as_deref(), false);
     println!("{} {}", "OK".green().bold(), summary);
 }
@@ -170,7 +176,7 @@ pub fn clean(slug: Option<&str>) {
 /// LLM extraction is handled by the AI agent via the stop hook — no external API needed.
 pub fn consolidate(slug: Option<&str>, dry_run: bool) {
     let store = get_store();
-    let project = resolve_project_slug(&[slug]);
+    let project = resolve_memory_project(slug);
     let summary = consolidate_steps_abcd(&store, project.as_deref(), dry_run);
     println!("{} Consolidate complete:", "OK".green().bold());
     println!("  {}", summary);
@@ -210,47 +216,52 @@ fn consolidate_steps_abcd(store: &MemoryStore, project: Option<&str>, dry_run: b
         if !file_path.exists() {
             continue;
         }
-        let mut entries = store.read_jsonl(file_path);
-        let before = entries.len();
+        let (expired, commit_purged, dedup, promoted) = store.with_file_lock(file_path, || {
+            let mut entries = store.read_jsonl(file_path);
+            let before = entries.len();
 
-        // Step A — purge expired entries
-        entries.retain(|e| {
-            if let Some(ref exp) = e.expires_at {
-                if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(exp) {
-                    return exp_dt.with_timezone(&chrono::Utc) > now;
+            // Step A — purge expired entries
+            entries.retain(|e| {
+                if let Some(ref exp) = e.expires_at {
+                    if let Ok(exp_dt) = chrono::DateTime::parse_from_rfc3339(exp) {
+                        return exp_dt.with_timezone(&chrono::Utc) > now;
+                    }
+                }
+                true
+            });
+            let after_a = entries.len();
+
+            // Step B — purge [commit] entries
+            entries.retain(|e| !e.content.starts_with("[commit]"));
+            let after_b = entries.len();
+
+            // Step C — content-based dedup (Jaccard > 0.85)
+            let dedup_ids = find_dedup_ids(&entries);
+            let dedup_count = dedup_ids.len();
+            if !dedup_ids.is_empty() {
+                entries.retain(|e| !dedup_ids.contains(&e.id));
+            }
+
+            // Step D — auto-promote entries with recall_count >= 3
+            let mut promoted_in_file = 0usize;
+            for entry in &mut entries {
+                if entry.recall_count >= 3 && !entry.priority {
+                    entry.priority = true;
+                    entry.updated = now.to_rfc3339();
+                    promoted_in_file += 1;
                 }
             }
-            true
-        });
-        let after_a = entries.len();
-        total_expired += before - after_a;
 
-        // Step B — purge [commit] entries
-        entries.retain(|e| !e.content.starts_with("[commit]"));
-        let after_b = entries.len();
-        total_commit += after_a - after_b;
-
-        // Step C — content-based dedup (Jaccard > 0.85)
-        let dedup_ids = find_dedup_ids(&entries);
-        total_dedup += dedup_ids.len();
-        if !dedup_ids.is_empty() {
-            entries.retain(|e| !dedup_ids.contains(&e.id));
-        }
-
-        // Step D — auto-promote entries with recall_count >= 3
-        let mut promoted_in_file = 0usize;
-        for entry in &mut entries {
-            if entry.recall_count >= 3 && !entry.priority {
-                entry.priority = true;
-                entry.updated = now.to_rfc3339();
-                promoted_in_file += 1;
+            if !dry_run {
+                store.rewrite_file(file_path, &entries);
             }
-        }
-        total_promoted += promoted_in_file;
 
-        if !dry_run {
-            store.rewrite_file(file_path, &entries);
-        }
+            (before - after_a, after_a - after_b, dedup_count, promoted_in_file)
+        });
+        total_expired += expired;
+        total_commit += commit_purged;
+        total_dedup += dedup;
+        total_promoted += promoted;
     }
 
     format!(

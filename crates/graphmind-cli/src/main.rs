@@ -41,6 +41,10 @@ enum Commands {
         reset: bool,
         #[arg(long)]
         watch: bool,
+        /// Incrementally rebuild only files changed between two git refs
+        /// (used by the post-checkout hook on branch switch)
+        #[arg(long, num_args = 2, value_names = ["OLD_HEAD", "NEW_HEAD"])]
+        changed: Option<Vec<String>>,
     },
     /// Query a symbol
     Query {
@@ -217,6 +221,11 @@ enum Commands {
         slug: Option<String>,
         #[arg(long)]
         all: bool,
+        /// Unregister and remove graphs for projects whose path no longer
+        /// exists, or whose worktree was removed from its repo (checked
+        /// via `git worktree list` for projects with a repo_id)
+        #[arg(long)]
+        stale: bool,
     },
     /// Sync CLAUDE.md with graph stats
     Sync {
@@ -401,7 +410,7 @@ enum SessionAction {
 enum InstallAction {
     /// Install Claude Code search hook (redirects grep/find to graphmind)
     HookClaude,
-    /// Install git hooks (post-commit + pre-push)
+    /// Install git hooks (rebuild after commit/merge/rebase/checkout, diff-impact before push)
     HookGit {
         slug: Option<String>,
     },
@@ -459,8 +468,16 @@ fn main() {
     let cli = Cli::parse();
     graphmind_config::ensure_dirs();
 
+    let skip_notices = std::env::var("GRAPHMIND_SKIP_NOTICES").is_ok();
+
+    // A worktree registered on the fly gets its graph seeded, then built in the
+    // background — except by `build` itself, which is about to do it.
+    if !matches!(cli.command, Commands::Build { changed: None, .. }) {
+        graphmind_config::on_worktree_linked(graphmind_config::spawn_background_build);
+    }
+
     // Show notices (setup outdated, announcements) except for setup/mcp/update commands
-    if !matches!(cli.command, Commands::Setup | Commands::Mcp | Commands::Update { .. }) {
+    if !skip_notices && !matches!(cli.command, Commands::Setup | Commands::Mcp | Commands::Update { .. }) {
         commands::notices::check_setup_version();
         commands::notices::check_announcements();
         commands::notices::check_cli_update();
@@ -471,7 +488,7 @@ fn main() {
     }
 
     // Silent license revalidation every 24h (non-blocking)
-    if !matches!(cli.command, Commands::Auth { .. }) {
+    if !skip_notices && !matches!(cli.command, Commands::Auth { .. }) {
         std::thread::spawn(commands::auth::maybe_revalidate);
     }
 
@@ -498,8 +515,13 @@ fn main() {
             full,
             reset,
             watch,
+            changed,
         } => {
-            commands::build::build(slug.as_deref(), all, full, reset, watch);
+            if let Some(refs) = changed {
+                commands::build::build_changed_between(slug.as_deref(), &refs[0], &refs[1]);
+            } else {
+                commands::build::build(slug.as_deref(), all, full, reset, watch);
+            }
         }
         Commands::Query { name, slug, file, kind, limit, offset } => {
             commands::query::query_symbol(&name, slug.as_deref(), file.as_deref(), kind.as_deref(), limit, offset);
@@ -650,8 +672,12 @@ fn main() {
                 }
             },
         },
-        Commands::Clean { slug, all } => {
-            commands::clean::clean(slug.as_deref(), all);
+        Commands::Clean { slug, all, stale } => {
+            if stale {
+                commands::clean::clean_stale();
+            } else {
+                commands::clean::clean(slug.as_deref(), all);
+            }
         }
         Commands::Sync { slug, all, dir } => {
             commands::sync::sync(slug.as_deref(), all, dir.as_deref());
