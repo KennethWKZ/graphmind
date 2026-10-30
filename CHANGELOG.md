@@ -5,6 +5,19 @@ Releases before 0.3.0: see [GitHub releases](https://github.com/aouicher/graphmi
 
 ## [Unreleased]
 
+### Fixed
+
+- **Files that aren't UTF-8 are reported.** The build dropped a source file it couldn't read as UTF-8 (a Latin-1 PHP file, say) without a word: it wasn't in the skipped count, and whatever an earlier build stored for it stayed. The build now names it (`Skipped src/legacy.php: not UTF-8`), counts it as skipped, and removes its earlier records. A file that can't be read (permissions) is skipped with a warning instead and keeps what the graph has, like a folder that can't be read. Files the parser refuses are named and skipped like files that aren't UTF-8 (`Skipped config.yml: Unsupported language: yaml`); before, such a file kept its old symbols without their outgoing edges.
+- **Minified files leave nothing behind.** A file indexed before it became minified (more than 5,000 characters, lines averaging over 500), or before graphmind skipped such files, kept its old symbols and file record forever: the file was still on disk, so cleanup never removed them, and the minified check meant it was never parsed again. The build now removes them the first time it skips the file, and counts them as deleted once.
+- **Skipped minified files are named.** The build prints `Skipped <path>: minified (average line N bytes)` for each one, instead of only counting them.
+- **Markdown isn't skipped as minified.** A document written one paragraph per line averages over 500 characters a line, like a minified file, and was left out of the graph. Markdown is now always indexed.
+- MCP entries point at a graphmind that exists when it's installed in `~/.local/bin` or Homebrew's folder and the process doesn't have that folder on PATH, as in the desktop app started from the Finder. Thanks @KennethWKZ.
+- **`gm_file` returns large files in pages.** It returned the whole file in one result. MCP clients save a result over their output limit to a file and give the model the path instead, which costs an extra hop and a read of the oversized file. It now returns pages of about 10k tokens, capped in bytes so non-Latin text stays under the limit too, cut after the last whole line that fits, and ends a partial page with where to continue. New parameters read any range: `offset` (1-based line number), `limit` (lines) and `column` (1-based byte column within the `offset` line, for lines longer than a page); a value that isn't a valid integer is an error instead of silently returning the first page. MCP results cut to size no longer panic when the cut falls inside a multi-byte character.
+- When it finds no graphmind, the desktop app installs one to `~/.local/bin`, like the install script, instead of `~/.graphmind/bin`; one it finds (Homebrew's included) is left alone, and a failed download no longer leaves `graphmind.tmp` behind. Thanks @KennethWKZ.
+- Setup and `graphmind uninstall all` also remove the `~/.graphmind/bin` PATH line that desktop app versions 0.2.56 to 0.2.87 could add to `.bash_profile`. Thanks @KennethWKZ.
+- **Generator functions are indexed.** In TypeScript and JavaScript, `function* name() {}` was never stored as a symbol, so `outline`, `fn` and `who-calls` didn't know it, and calls to it or from it were dropped without a warning. Generator functions are now functions like any other, with their callers and callees. Run `graphmind build --full` once to pick up generators in files that haven't changed. Reported in #187.
+- **`graphmind init <PATH>` sets up `<PATH>` from any folder.** Run from outside the repo, it registered `<PATH>` and then stopped at the git hooks step with "Not in a registered project", leaving the project without hooks or a graph. Run from inside another registered repo, it installed hooks in that repo and built it instead. The hooks and the build now use the project `init` just registered. Reported in #183.
+
 ## [0.3.7] - 2026-10-15
 
 ### Fixed
