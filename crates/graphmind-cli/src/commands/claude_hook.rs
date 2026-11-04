@@ -136,7 +136,7 @@ if [ -n "$RECENT_MEM" ]; then
   MSG="$MSG${NL}${NL}Recent memories:${NL}$RECENT_MEM"
 fi
 
-MSG="$MSG${NL}${NL}Auto-memory is ON: save decisions/patterns/conventions via gm_memory_add. Use --priority for always-injected facts. Recall via gm_memory_search."
+MSG="$MSG${NL}${NL}Memory: save a decision, pattern, convention or bug when it is decided or found, and only if a future session needs it: one fact with the exact identifiers someone would search for (graphmind memory add '<fact>' --type <type> --tags <tag> <tag>). Rewrite or delete a fact that changed (graphmind memory update <id> --content '<new text>'); never add a contradicting one. --priority only for the few facts every session needs. Recall: graphmind memory search or gm_memory_search."
 
 if [ ${#MSG} -gt $MAX_CHARS ]; then
   MSG="${MSG:0:$MAX_CHARS}${NL}[graphmind: cut to fit the hook output limit]"

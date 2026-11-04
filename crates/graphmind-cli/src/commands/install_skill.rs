@@ -79,7 +79,7 @@ Outside a registered project:
 
 Every command above takes `--slug` except `graphmind list` and `graphmind cross query`, which span all projects. A slug that isn't registered fails with "Project '<slug>' is not registered (see `graphmind list`)". `graphmind diff-impact` reads the git changes of the current directory, so it only works from inside the project's checkout.
 
-When a registered project matches the question, never fall back to grep or find across unrelated folders.
+When a registered project matches the question, stay in that project: `--slug <project>` for callers, blast radius, vague searches and memory, and `rg` in its path (from `graphmind list`) for exact strings. Don't search unrelated folders.
 
 ## Execution
 
