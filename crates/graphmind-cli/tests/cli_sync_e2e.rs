@@ -13,11 +13,14 @@ fn sync_creates_claude_md_if_missing() {
     let content = fs::read_to_string(&claude_md).unwrap();
     assert!(content.contains("<!-- GM:START -->"), "CLAUDE.md should contain GM:START, got: {content}");
     assert!(content.contains("<!-- GM:END -->"), "CLAUDE.md should contain GM:END");
+    assert!(content.contains("use `/gm` for questions about a registered project"), "{content}");
+    assert!(content.contains("save with `--slug <project>` when the fact is about that project"), "{content}");
+    assert!(!content.contains("always use `--global`"), "{content}");
     assert!(content.contains("| Find symbol | `gm_fn` |"), "{content}");
 }
 
-/// The project section routes by question (cheapest tool first), not "/gm first for everything"
-/// like setup's global block, and keeps memory small and current.
+/// The project section routes by question (cheapest tool first), not "/gm first for everything",
+/// and keeps memory small and current.
 #[test]
 fn sync_section_routes_by_question_not_graph_first() {
     let env = QueryTestEnv::new();
@@ -29,7 +32,7 @@ fn sync_section_routes_by_question_not_graph_first() {
     assert!(content.contains("`rg` (or the Grep tool), then Read"), "{content}");
     assert!(content.contains("`gm_fn` (`/gm-fn <symbol>`) or `gm_who_calls_chain`"), "{content}");
     assert!(content.contains("`graphmind memory update <id> --content"), "{content}");
-    assert!(content.contains("Facts about this repo stay project-scoped"), "{content}");
+    assert!(content.contains("facts about it stay project-scoped (no `--global`)"), "{content}");
     for graph_first in ["ALWAYS use `/gm` as the FIRST step", "Only fall back to grep", "You MUST proactively save"] {
         assert!(!content.contains(graph_first), "{graph_first:?} still in: {content}");
     }
