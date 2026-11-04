@@ -5,6 +5,10 @@ Releases before 0.3.0: see [GitHub releases](https://github.com/aouicher/graphmi
 
 ## [Unreleased]
 
+### Added
+
+- **Opt a repo out of automatic worktree registration.** graphmind registers a new worktree of a registered repo the first time any command runs in it, the Claude Code hooks included, then builds its graph, which embeds its symbols when semantic search is on. `graphmind link-worktrees off` (in the repo, or with `--slug <project>`) stops that for the whole repo; `on` turns it back on, and `graphmind link-worktrees` prints the setting. Worktrees registered before stay registered; `graphmind unregister <slug>` drops one. In an opted-out worktree, commands, MCP tools and the Claude Code hooks find no project, so they give no memory or code context there. `graphmind list` marks the project `[worktrees not linked]`. Thanks @KennethWKZ.
+
 ### Fixed
 
 - **Files that aren't UTF-8 are reported.** The build dropped a source file it couldn't read as UTF-8 (a Latin-1 PHP file, say) without a word: it wasn't in the skipped count, and whatever an earlier build stored for it stayed. The build now names it (`Skipped src/legacy.php: not UTF-8`), counts it as skipped, and removes its earlier records. A file that can't be read (permissions) is skipped with a warning instead and keeps what the graph has, like a folder that can't be read. Files the parser refuses are named and skipped like files that aren't UTF-8 (`Skipped config.yml: Unsupported language: yaml`); before, such a file kept its old symbols without their outgoing edges.
