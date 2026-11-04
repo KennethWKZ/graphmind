@@ -651,9 +651,11 @@ impl Registry {
         config.projects.get(slug).cloned()
     }
 
-    /// Forgets the worktrees graphmind registered automatically whose directory is gone and
-    /// removes their graphs: their memory lives with the primary, so nothing is lost. Returns
-    /// their slugs. Projects registered by hand stay (`graphmind clean --stale` prunes those).
+    /// Forgets the worktrees whose directory is gone and removes their graphs: their memory lives
+    /// with the primary, so nothing is lost. Returns their slugs. A worktree here is any project
+    /// with a `primary` (`is_gone_worktree`), whether it was linked automatically or registered
+    /// by hand (`graphmind register` on a worktree's root sets `primary` too). Projects without a
+    /// `primary` stay, even when their directory is gone (`graphmind clean --stale` prunes those).
     pub fn forget_gone_worktrees() -> Vec<String> {
         // Lock-free early exit for the common case: nothing to forget.
         if !load_config().projects.values().any(is_gone_worktree) {
