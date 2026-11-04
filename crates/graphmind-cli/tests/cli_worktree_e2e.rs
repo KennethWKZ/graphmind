@@ -340,8 +340,9 @@ fn build_all_succeeds_after_a_worktree_is_removed() {
     assert!(!env.run_ok(&["list"]).contains("wt2"));
 }
 
-/// A project registered by hand stays listed when its folder is gone: only worktrees graphmind
-/// registered itself are forgotten on their own; `clean --stale` handles the rest.
+/// A project without a `primary` (here, registered by hand outside any git repo) stays listed when
+/// its folder is gone: only worktrees, projects with a `primary` however they were registered, are
+/// forgotten on their own; `clean --stale` handles the rest.
 #[test]
 fn list_keeps_a_missing_project_registered_by_hand() {
     let env = CliTestEnv::new();
