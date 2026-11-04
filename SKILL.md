@@ -2,16 +2,21 @@
 description: >
   graphmind gives Claude Code persistent memory and structural code intelligence
   across all registered projects. Auto-triggers in any registered project directory.
-  MANDATORY: query graphmind before using grep, find, or reading source files.
+  Use the cheapest tool for the question: graphmind for callers, blast radius and
+  searches with no names to grep for; rg for exact strings.
 allowed-tools: Bash, Read, Write
 ---
 
 # graphmind — Persistent Code Intelligence
 
-## MANDATORY: Search through graphmind FIRST
+## When to use graphmind
 
-**Before using Grep, find, rg, ag, or reading files to understand code:**
-You MUST query graphmind first. Only fall back to grep/find if graphmind cannot answer (e.g., string literals, config values, non-code patterns).
+Use the cheapest tool that answers the question; no tool has to come first.
+1. "Why is it like this / did we already decide this": `graphmind memory search "<terms>"` and the repo's ADRs, before reading code.
+2. Exact strings, config values, env vars, routes, migrations: `rg` (or Grep), then Read.
+3. A vague "where is the thing that does X", with no names to search for: `graphmind search "<query>"`, then Read.
+4. Callers, callees or blast radius of one symbol: `graphmind fn <symbol>` or `gm_who_calls_chain`, then Read what you'll edit.
+5. Memory and code disagree: say so and show both.
 
 | Need | Command | MCP tool |
 |------|---------|----------|
