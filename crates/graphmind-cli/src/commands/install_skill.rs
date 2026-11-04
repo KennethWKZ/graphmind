@@ -8,10 +8,11 @@ use std::fs;
 const SKILL_CONTENT: &str = r#"---
 name: gm
 description: >
-  Code intelligence via graphmind. Use /gm <query> for ALL code exploration:
-  find symbols, trace callers, view dependencies, file outlines, impact analysis.
-  Replaces grep/find/Explore agents in any graphmind-registered project, and
-  answers questions about a registered project from outside it (with --slug).
+  Code intelligence via graphmind: callers and callees of a symbol, blast radius,
+  dependencies, file outlines, and searches with no names to grep for, in any
+  graphmind-registered project; also answers questions about a registered project
+  from outside it (with --slug). For exact strings, config values and routes, rg
+  then Read is the right tool.
 allowed-tools: Bash, Read
 ---
 
