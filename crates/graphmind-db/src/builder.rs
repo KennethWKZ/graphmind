@@ -116,8 +116,8 @@ fn shebang_language(first_line: &str) -> Option<&'static str> {
 }
 
 /// The language of the regular file at `path` from its first line, read from at most its first
-/// 256 bytes. None when it can't be read or names no known shell.
-fn script_language(path: &Path) -> Option<&'static str> {
+/// 256 bytes. None when it can't be read or names no known shell. `build --watch` uses it too.
+pub fn script_language(path: &Path) -> Option<&'static str> {
     use std::io::Read;
     let mut head = Vec::with_capacity(256);
     fs::File::open(path).ok()?.take(256).read_to_end(&mut head).ok()?;
