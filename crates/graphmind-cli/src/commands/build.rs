@@ -641,22 +641,34 @@ const WATCHED_EXTS: [&str; 47] = [
     ".graphql", ".gql", ".ps1", ".psm1",
 ];
 
-/// Directory segments `build --watch` ignores.
+/// Directory names `build --watch` ignores anywhere inside the project.
 const EXCLUDED_DIRS: [&str; 20] = [
     "node_modules", "dist", "build", "out", ".git", ".next", ".nuxt",
     ".turbo", "coverage", "__pycache__", ".venv", "venv", "env",
     "vendor", "target", "tmp", "log", "cdk.out", ".terraform", ".serverless",
 ];
 
+/// Whether `path` lies in an excluded directory of the project at `root`. Only the folders
+/// between the root and the file count, whole names only: a project that itself sits under
+/// `/tmp` or a `build` folder is still watched, and a file named `build` isn't excluded. A path
+/// outside the root counts as excluded, since the rebuild would drop it anyway.
+fn in_excluded_dir(path: &Path, root: &Path) -> bool {
+    let Ok(rel) = path.strip_prefix(root) else { return true };
+    rel.parent().is_some_and(|dir| {
+        dir.components().any(|c| EXCLUDED_DIRS.iter().any(|name| c.as_os_str() == *name))
+    })
+}
+
 /// Whether a changed path makes `build --watch` rebuild: a file with a watched extension, or an
 /// extensionless shell script, known by its `#!` line as the builder reads it. A deleted
 /// extensionless path can't be read any more, so it counts when `was_indexed` says the graph has
-/// it. Dotfiles, which the build skips, and paths in an excluded directory never count.
-fn is_watched(path: &Path, was_indexed: impl Fn(&Path) -> bool) -> bool {
-    let s = path.to_string_lossy();
-    if EXCLUDED_DIRS.iter().any(|dir| s.contains(&format!("/{dir}/")) || s.contains(&format!("\\{dir}\\"))) {
+/// it. Dotfiles, which the build skips, and paths in an excluded directory of the project at
+/// `root` never count.
+fn is_watched(path: &Path, root: &Path, was_indexed: impl Fn(&Path) -> bool) -> bool {
+    if in_excluded_dir(path, root) {
         return false;
     }
+    let s = path.to_string_lossy();
     if WATCHED_EXTS.iter().any(|ext| s.ends_with(ext)) {
         return true;
     }
@@ -702,6 +714,7 @@ fn watch_project(slug: &str) {
 
     println!("{} Watching for changes... (Ctrl+C to stop)", ">>".cyan().bold());
 
+    let root = PathBuf::from(&project.path);
     // A deleted extensionless file can't be read for its `#!` line: it counts when the graph has it.
     let graph_db_path = paths::graph_db_path(slug);
     let was_indexed = |path: &Path| -> bool {
@@ -717,7 +730,7 @@ fn watch_project(slug: &str) {
                 let changed: Vec<PathBuf> = events.iter()
                     .filter(|e| e.kind == DebouncedEventKind::Any)
                     .map(|e| e.path.clone())
-                    .filter(|p| is_watched(p, was_indexed))
+                    .filter(|p| is_watched(p, &root, was_indexed))
                     .collect::<std::collections::HashSet<_>>()
                     .into_iter()
                     .collect();
@@ -783,10 +796,10 @@ mod watch_tests {
     #[test]
     fn files_with_a_watched_extension_count() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(is_watched(&dir.path().join("src/app.ts"), never));
-        assert!(is_watched(&dir.path().join("deploy.sh"), never));
-        assert!(!is_watched(&dir.path().join("notes.txt"), never));
-        assert!(!is_watched(&dir.path().join("node_modules/pkg/index.ts"), never));
+        assert!(is_watched(&dir.path().join("src/app.ts"), dir.path(), never));
+        assert!(is_watched(&dir.path().join("deploy.sh"), dir.path(), never));
+        assert!(!is_watched(&dir.path().join("notes.txt"), dir.path(), never));
+        assert!(!is_watched(&dir.path().join("node_modules/pkg/index.ts"), dir.path(), never));
     }
 
     #[test]
@@ -797,23 +810,57 @@ mod watch_tests {
             std::fs::write(&path, body).unwrap();
             path
         };
-        assert!(is_watched(&write("mycli", "#!/bin/bash\nmain() { :; }\n"), never));
-        assert!(is_watched(&write("deploy", "#!/usr/bin/env -S zsh -e\n"), never));
-        assert!(!is_watched(&write("NOTES", "plain text\n"), never));
-        assert!(!is_watched(&write("tool", "#!/usr/bin/env python3\n"), never));
+        assert!(is_watched(&write("mycli", "#!/bin/bash\nmain() { :; }\n"), dir.path(), never));
+        assert!(is_watched(&write("deploy", "#!/usr/bin/env -S zsh -e\n"), dir.path(), never));
+        assert!(!is_watched(&write("NOTES", "plain text\n"), dir.path(), never));
+        assert!(!is_watched(&write("tool", "#!/usr/bin/env python3\n"), dir.path(), never));
         // The build skips dotfiles, so a change to one never starts a rebuild.
-        assert!(!is_watched(&write(".envrc", "#!/bin/sh\n"), never));
+        assert!(!is_watched(&write(".envrc", "#!/bin/sh\n"), dir.path(), never));
         // A folder named like a script isn't a file.
         std::fs::create_dir(dir.path().join("bin")).unwrap();
-        assert!(!is_watched(&dir.path().join("bin"), never));
+        assert!(!is_watched(&dir.path().join("bin"), dir.path(), never));
     }
 
     #[test]
     fn a_deleted_extensionless_path_counts_only_when_the_graph_has_it() {
         let dir = tempfile::tempdir().unwrap();
         let gone = dir.path().join("mycli");
-        assert!(is_watched(&gone, |p: &Path| p.ends_with("mycli")));
+        assert!(is_watched(&gone, dir.path(), |p: &Path| p.ends_with("mycli")));
         // An editor's probe file (vim's "4913") the graph never held.
-        assert!(!is_watched(&dir.path().join("4913"), |p: &Path| p.ends_with("mycli")));
+        assert!(!is_watched(&dir.path().join("4913"), dir.path(), |p: &Path| p.ends_with("mycli")));
+    }
+}
+
+#[cfg(test)]
+mod excluded_dir_tests {
+    use super::in_excluded_dir;
+    use std::path::Path;
+
+    #[test]
+    fn only_folders_inside_the_project_count() {
+        // A project under /tmp, /private/tmp or a build folder: its own files are watched.
+        for root in ["/tmp/proj", "/private/tmp/proj", "/home/me/build/proj", "/srv/log/env/proj"] {
+            let root = Path::new(root);
+            assert!(!in_excluded_dir(&root.join("src/app.ts"), root), "{}", root.display());
+            assert!(!in_excluded_dir(&root.join("app.ts"), root), "{}", root.display());
+            assert!(in_excluded_dir(&root.join("node_modules/pkg/index.ts"), root), "{}", root.display());
+        }
+    }
+
+    #[test]
+    fn excluded_names_match_whole_folders_at_any_depth() {
+        let root = Path::new("/work/proj");
+        assert!(in_excluded_dir(Path::new("/work/proj/src/tmp/x.ts"), root));
+        assert!(in_excluded_dir(Path::new("/work/proj/packages/a/dist/index.js"), root));
+        assert!(in_excluded_dir(Path::new("/work/proj/.git/hooks/x.sh"), root));
+        // Names that only contain an excluded one, and files named like one, are not excluded.
+        assert!(!in_excluded_dir(Path::new("/work/proj/builder/x.ts"), root));
+        assert!(!in_excluded_dir(Path::new("/work/proj/src/logs/x.ts"), root));
+        assert!(!in_excluded_dir(Path::new("/work/proj/build"), root));
+    }
+
+    #[test]
+    fn a_path_outside_the_project_counts_as_excluded() {
+        assert!(in_excluded_dir(Path::new("/elsewhere/x.ts"), Path::new("/work/proj")));
     }
 }
