@@ -436,3 +436,37 @@ fn prompt_hook_searches_do_not_count_recalls() {
         .unwrap();
     assert_eq!(entry["recall_count"], 0, "{entry}");
 }
+
+/// A resumed or forked session already holds the SessionStart briefing in its restored transcript: the hook
+/// prints nothing and keeps the session's shown-state. Startup, /clear and compaction still brief. Empty state
+/// folders of other sessions are left alone while they are new (a parallel hook writes into them a moment later).
+#[test]
+fn session_hook_skips_resume_and_fork() {
+    if std::process::Command::new("jq").arg("--version").output().is_err() {
+        return; // the hooks need jq
+    }
+    let env = CliTestEnv::new();
+    current_setup(&env);
+    let project = env.fixture_path();
+    env.run_ok(&["install", "hook-claude"]);
+    env.run_ok(&["memory", "add", "deploy pipeline uses terraform apply", "--slug", "hooks-test", "--priority"]);
+
+    let state = env.home.path().join(".graphmind/hook-state");
+    let fresh = state.join("parallel-session");
+    std::fs::create_dir_all(&fresh).unwrap();
+
+    for source in ["startup", "clear", "compact"] {
+        let out = run_hook(&env, "graphmind-session.sh", &project, &json!({"session_id": "s1", "source": source}));
+        assert!(out.contains("terraform apply"), "{source} briefs: {out}");
+    }
+    assert!(fresh.is_dir(), "a new empty state folder of another session is kept");
+    let ids = state.join("s1/priority-ids");
+    let shown = std::fs::read_to_string(&ids).unwrap();
+    assert!(!shown.trim().is_empty(), "shown ids recorded");
+
+    for source in ["resume", "fork"] {
+        let out = run_hook(&env, "graphmind-session.sh", &project, &json!({"session_id": "s1", "source": source}));
+        assert!(out.trim().is_empty(), "{source} prints nothing: {out}");
+        assert_eq!(std::fs::read_to_string(&ids).unwrap(), shown, "{source} keeps the shown-state");
+    }
+}
